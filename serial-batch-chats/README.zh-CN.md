@@ -137,11 +137,6 @@ python -X utf8 -B -m unittest discover -s scripts -p 'test_*.py' -v
 
 仓库提供 Windows GitHub Actions 配置。离线测试通过与真实两聊天冒烟测试通过应分开报告。
 
-## 发布与贡献
-
-在 GitHub 创建空仓库，将本文件夹的内容上传到仓库根目录，使 `SKILL.md`、`README.md` 和 `LICENSE` 位于根层。本次打包只准备本地文件，不创建远程仓库或 release。
-
-贡献时保持改动集中，运行离线测试；安装方式或行为变化时同步更新两份 README。兼容性问题请附操作系统、Codex 版本、命令和脱敏错误，不公开 `.batch-runs/`、聊天记录、登录数据或本地项目路径。
 
 ## 许可证
 
