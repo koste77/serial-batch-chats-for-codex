@@ -138,11 +138,7 @@ The existing tests use simulated clients and temporary files. They cover serial 
 
 The included GitHub Actions workflow runs these tests on Windows. A passing offline suite is separate from a successful live two-chat smoke test.
 
-## Publish and contribute
 
-Create an empty GitHub repository, then upload the contents of this folder with `SKILL.md`, `README.md`, and `LICENSE` at the repository root. The folder is ready for upload; no remote repository or release has been created by packaging it.
-
-For contributions, keep changes focused, run the offline tests, and update both README files when changing setup or behavior. Compatibility reports should include the operating system, Codex version, command, and redacted error. Keep `.batch-runs/`, transcripts, authentication data, and local project paths out of public issues and commits.
 
 ## License
 
