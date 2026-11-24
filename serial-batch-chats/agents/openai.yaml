@@ -1,0 +1,4 @@
+interface:
+  display_name: "串行多会话任务调度"
+  short_description: "先制定任务计划，再串行创建项目聊天，由主会话监控验收并继续下一批"
+  default_prompt: "使用 $serial-batch-chats 将当前任务制定为分批计划，在本项目逐批创建独立聊天，由主会话监控验收直到完成或遇到真实阻塞。"
