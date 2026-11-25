@@ -8,6 +8,7 @@ run.json 示例（仅展示一批，实际按依赖添加）：
 {
   "task": "简单交接检测",
   "plan_document": ".batch-runs/demo/PLAN.md",
+  "chat_defaults": {"model": "gpt-6.1-sol", "reasoning_effort": "ultra"},
   "batches": [
     {
       "id": "B01",
@@ -16,7 +17,8 @@ run.json 示例（仅展示一批，实际按依赖添加）：
       "acceptance": ".batch-runs/demo/B01/acceptance.json",
       "criteria": ["B01.1", "B01.2", "B01.3"],
       "review_roles": [],
-      "pause_after": false
+      "pause_after": false,
+      "chat": {"reasoning_effort": "high"}
     }
   ]
 }
@@ -71,3 +73,27 @@ checks 必须与计划中的 criteria 完全一致；各项用独立证据文件
 > 最终回答包含 `BATCH_DONE <ID> PASS` 或 `BATCH_DONE <ID> BLOCKED`、真实指标、证据路径和下批输入。口头信号不能代替落盘验收。
 
 恢复时，PASS 的文件摘要须与调度回执一致；计划、提示或已验收证据变更须先复核。不能凭旧文件跳过新尝试，也不能把上个任务的验收移到当前任务。
+
+## 模型配置与主审门禁
+
+上例 B01 使用 gpt-6.1-sol/high，后续无覆盖批次使用 gpt-6.1-sol/ultra。它们是可改示例，不代表所有服务商支持。chat_defaults 和逐批 chat 均可省略，也可只指定一个字段；仅接受非空字符串 model、reasoning_effort。配置属于计划摘要，修改后须复核；已有聊天不为换模型而重建。
+
+备用脚本正常完成后保存 transcript，停在 AWAITING_PRIMARY_REVIEW。主会话独立核验真实原始证据后写本批 primary_gate.json：
+
+```json
+{
+  "batch": "B01",
+  "status": "PASS",
+  "thread_id": "实际聊天ID",
+  "turn_id": "实际最新正常完成回合ID",
+  "hashes": {
+    ".batch-runs/demo/B01/acceptance.json": "实际SHA256",
+    ".batch-runs/demo/B01/calculation.json": "实际SHA256",
+    ".batch-runs/demo/B01/handoff.md": "实际SHA256"
+  }
+}
+```
+
+hashes 必须完整等于 desktop_batches.acceptance(root, batch) 返回的验收、独立证据、交接及所需 review.json 摘要映射。函数只验证协议与完整性，不代替内容审查。执行聊天不得写此门禁。再次 --run 才接受门禁并创建下一批；最终批次通过后标记 COMPLETE。
+
+WAITING_FOR_DESKTOP 表示等待桌面消费既有队列；RUNNING 的冷读 interrupted 仍需观察；AWAITING_PRIMARY_REVIEW 表示正常完成但未放行。状态文件不能替代实际审批和执行。

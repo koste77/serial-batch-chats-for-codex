@@ -95,7 +95,7 @@ python -X utf8 "$skillDirectory/scripts/prepare_smoke.py" --root "$projectRoot" 
 # 校验输入并列出计划标题，不创建聊天。
 python -X utf8 "$skillDirectory/scripts/desktop_batches.py" --root "$projectRoot" --plan '.batch-runs/smoke-01/run.json'
 
-# 已获授权后，创建并监控真实项目聊天。
+# 已获授权后，创建并排队当前唯一项目聊天。
 python -X utf8 "$skillDirectory/scripts/desktop_batches.py" --root "$projectRoot" --plan '.batch-runs/smoke-01/run.json' --run
 
 # state.json 已生成后，读取保存的调度状态。
@@ -141,3 +141,23 @@ python -X utf8 -B -m unittest discover -s scripts -p 'test_*.py' -v
 ## 许可证
 
 采用 [MIT 许可证](LICENSE)，版权署名为 serial-batch-chats contributors。
+
+## Desktop execution and model settings / 桌面执行与模型配置
+
+The fallback now creates and queues one batch. Start that existing message once in the desktop chat, then use --run --watch --interval 30 for read-only monitoring. Keep the coordinator attached to its script session. Cold interrupted snapshots do not prove a stopped desktop turn. Actual approvals stay in the original chat. Completion stops at AWAITING_PRIMARY_REVIEW; the coordinator checks evidence and writes primary_gate.json before another --run releases the next batch.
+
+备用通道改为“创建并排队→桌面启动→脚本只读监测→主会话主审→下一批”。--run 只取一次快照，--run --watch 持续监测。已有运行保留回执并复核后迁移，不删除状态重建聊天。
+
+run.json 可设置默认模型与强度，逐批 chat 可覆盖一个或两个字段：
+
+```json
+"chat_defaults": {"model": "gpt-6.1-sol", "reasoning_effort": "ultra"}
+```
+
+```json
+"chat": {"reasoning_effort": "high"}
+```
+
+These are editable examples. Precedence: per-batch chat > chat_defaults > host inheritance. Requested and returned settings are recorded; mismatch stops without recreating. Verify the desktop model control before starting. The coordinator model remains independent.
+
+详细命令、门禁及恢复见 [文件协议](references/protocol.md) 和 [桌面备用通道](references/desktop-fallback.md)。

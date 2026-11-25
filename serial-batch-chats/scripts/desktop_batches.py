@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 
 def require(condition, message):
@@ -33,7 +34,15 @@ def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.with_name(path.name + ".tmp")
     staging.write_bytes((json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-    os.replace(str(staging), str(path))
+    # Windows sync/indexing handles can briefly deny atomic replacement.
+    for attempt in range(4):
+        try:
+            os.replace(str(staging), str(path))
+            break
+        except PermissionError:
+            if os.name != "nt" or attempt == 3:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def digest(path):
@@ -55,6 +64,7 @@ def load_plan(root, path):
     require(isinstance(data.get("task"), str) and data["task"].strip(), "Missing task title")
     batches = data.get("batches")
     require(isinstance(batches, list) and batches, "Missing batches")
+    execution_options(data.get("chat_defaults", {}))
     files = {str(path.relative_to(root)): digest(path)}
     document = local(root, data["plan_document"])
     files[data["plan_document"]] = digest(document)
@@ -68,9 +78,22 @@ def load_plan(root, path):
         roles = batch.get("review_roles", [])
         require(isinstance(roles, list) and all(isinstance(x, str) and x for x in roles)
                 and len(set(roles)) == len(roles), "Invalid review roles")
+        execution_options(batch.get("chat", {}))
         files[batch["prompt"]] = digest(local(root, batch["prompt"]))
         local(root, batch["acceptance"])
     return data, files
+
+
+def execution_options(options):
+    require(isinstance(options, dict) and not set(options) - {"model", "reasoning_effort"},
+            "Chat settings support model and reasoning_effort only")
+    for key, value in options.items():
+        require(isinstance(value, str) and value.strip() == value and bool(value), "Invalid chat " + key)
+    return options
+
+
+def chat_settings(plan, batch):
+    return dict(execution_options(plan.get("chat_defaults", {})), **execution_options(batch.get("chat", {})))
 
 
 def acceptance(root, batch):
@@ -204,13 +227,7 @@ class Client:
         raise ValueError(method + " timed out")
 
     def wait_turn(self, thread, turn):
-        key = (thread, turn)
-        while key not in self.finished:
-            try:
-                self.event(30)
-            except queue.Empty:
-                print("WAIT " + thread + " " + turn, flush=True)
-        return self.finished[key]
+        raise ValueError("Fallback must not host execution turns; start queued work in the desktop and monitor read-only")
 
     def close(self):
         if self.process.poll() is None:
@@ -293,7 +310,7 @@ def completion_signal(thread, turn_id, batch_id):
     turn = turns[-1]
     require(turn.get("status") == "completed", "Latest turn is not completed")
     messages = [i for i in turn.get("items", []) if i.get("type") == "agentMessage"]
-    finals = [i for i in messages if i.get("phase") == "final_answer"]
+    finals = [i for i in messages if i.get("phase") in {"final", "final_answer"}]
     require(finals or messages, "Missing final assistant message")
     text = (finals or messages)[-1].get("text", "")
     signals = re.findall(r"\bBATCH_DONE\s+(B\d+)\s+(PASS|BLOCKED)\b", text)
@@ -331,69 +348,99 @@ def verify_passed(root, plan, rows, client=None, project=None):
 
 
 def execute(client, root, project, batch, row, checkpoint):
-    prepare_row(row)
+    folder = local(root, batch["acceptance"]).parent
     if not row:
         title = batch["title"] + "｜" + checkpoint.task
         require(not any(x.get("name") == title for x in project_rows(client, project, root, title)),
                 "An unrecorded chat already has this title; reconcile before creating")
-        row.update(status="CREATING", title=title, create_requested_at=now())
+        settings = getattr(checkpoint, "chat", {})
+        row.update(status="CREATING", title=title, create_requested_at=now(), requested_chat=settings)
         checkpoint()
-        thread = client.request("thread/start", {"cwd": str(root), "projectId": project,
-                                "sandbox": "workspace-write", "ephemeral": False})["thread"]
-        row.update(thread_id=thread["id"], project_id=project, created_at=now(), status="CREATED")
+        params = dict(cwd=str(root), projectId=project, sandbox="workspace-write", ephemeral=False)
+        if "model" in settings:
+            params["model"] = settings["model"]
+        if "reasoning_effort" in settings:
+            params["config"] = {"model_reasoning_effort": settings["reasoning_effort"]}
+        response = client.request("thread/start", params)
+        thread = response["thread"]
+        row.update(thread_id=thread["id"], project_id=project, created_at=now(), status="CREATED",
+                   actual_chat={"model": response.get("model"), "reasoning_effort": response.get("reasoningEffort")})
         checkpoint()
-        client.request("thread/name/set", {"threadId": row["thread_id"], "name": title})
-        actual = client.request("thread/read", {"threadId": row["thread_id"], "includeTurns": False})["thread"]
+        save(folder / "desktop_create_receipt.json", dict(thread_id=thread["id"],
+             requested=settings, actual=row["actual_chat"], created_at=now()))
+        require(all(row["actual_chat"].get(k) == v for k, v in settings.items()),
+                "Requested model/effort not confirmed; retain original chat, do not recreate")
+        client.request("thread/name/set", {"threadId": thread["id"], "name": title})
+        actual = client.request("thread/read", {"threadId": thread["id"], "includeTurns": True})["thread"]
         binding(actual, row, project, root)
-        # Save intent first: a lost response must never cause automatic input replay.
-        row["status"] = "SENDING"
+        require(not actual.get("turns"), "Unexpected existing turn before initial queue")
+        row.update(status="QUEUE_SENDING", client_user_message_id=str(uuid.uuid4()))
         checkpoint()
-        prompt = local(root, batch["prompt"]).read_text(encoding="utf-8-sig")
-        turn = client.request("turn/start", {"threadId": row["thread_id"],
-                              "input": [{"type": "text", "text": prompt}]})["turn"]
-        row.update(turn_id=turn["id"], status="RUNNING", started_at=now())
+        queued = client.request("thread/queue/add", {"threadId": thread["id"],
+            "clientUserMessageId": row["client_user_message_id"],
+            "input": [{"type": "text", "text": local(root, batch["prompt"]).read_text(encoding="utf-8-sig")}]})
+        save(folder / "desktop_initial_queue.json", queued)
+        row.update(status="QUEUED_FOR_DESKTOP", queue_id=queued["queuedSubmission"]["id"])
         checkpoint()
-    else:
-        resumed = client.request("thread/resume", {"threadId": row["thread_id"]})["thread"]
-        binding(resumed, row, project, root)
-        turns = resumed.get("turns", [])
-        if not any(t["id"] == row["turn_id"] for t in turns):
-            resumed = client.request("thread/read", {"threadId": row["thread_id"], "includeTurns": True})["thread"]
-            binding(resumed, row, project, root)
-            turns = resumed.get("turns", [])
-        require(turns and turns[-1]["id"] == row["turn_id"],
-                "Original chat has a newer user turn; reconcile its receipt before resuming")
-        for turn in turns:
-            if turn["id"] == row["turn_id"] and turn.get("status") != "inProgress":
-                client.finished[row["thread_id"], row["turn_id"]] = turn
+    elif not row.get("turn_id"):
+        require(row.get("status") in {"QUEUED_FOR_DESKTOP", "WAITING_FOR_DESKTOP"} and row.get("queue_id"),
+                "Uncertain create/queue receipt; inspect original chat, do not recreate or resend")
     verify_list(client, row, project, root)
     row["project_list_verified"] = True
-    refresh_sidebar(client, row, project)
+    if row.get("sidebar_title_visible") is not True:
+        require(refresh_sidebar(client, row, project), "Sidebar verification failed; retain original chat")
     checkpoint()
     print("CHAT " + batch["id"] + " " + row["thread_id"], flush=True)
-    completed = client.wait_turn(row["thread_id"], row["turn_id"])
-    row.update(turn_status=completed["status"], completed_at=row.get("completed_at", now()))
-    checkpoint()
-    actual = client.request("thread/read", {"threadId": row["thread_id"], "includeTurns": True})["thread"]
-    binding(actual, row, project, root)
-    transcript = {"thread_id": row["thread_id"], "title": row["title"], "project_id": project,
-                  "cwd": str(root), "turns": [
-                      {"id": t["id"], "status": t["status"], "messages": [
-                          i for i in t.get("items", []) if i.get("type") == "agentMessage"]}
-                      for t in actual.get("turns", [])]}
-    save(local(root, batch["acceptance"]).parent / "transcript.json", transcript)
-    require(completed["status"] == "completed", "Turn did not finish normally")
-    completion_signal(actual, row["turn_id"], batch["id"])
-    if row.get("sidebar_title_visible") is not True:
-        require(refresh_sidebar(client, row, project), "Chat completed but sidebar refresh failed; stop subsequent dispatch")
+    while True:
+        actual = client.request("thread/read", {"threadId": row["thread_id"], "includeTurns": True})["thread"]
+        binding(actual, row, project, root)
+        turns = actual.get("turns", [])
+        if not row.get("turn_id"):
+            # Queue consumption can leave an empty prompt turn followed by the desktop agent turn.
+            agents = [t for t in turns if any(i.get("type") == "agentMessage" for i in t.get("items", []))]
+            if agents:
+                queue_state = client.request("thread/queue/list", {"threadId": row["thread_id"]})
+                require(not queue_state["data"], "Initial queue not empty; reconcile before attaching desktop turn")
+                row.update(turn_id=agents[-1]["id"], status="RUNNING", started_at=now())
+                checkpoint()
+            else:
+                row["status"] = "WAITING_FOR_DESKTOP"
+        if row.get("turn_id"):
+            require(turns and turns[-1]["id"] == row["turn_id"],
+                    "Original chat has a newer turn; verify then use --adopt-turn in the same chat")
+            turn = turns[-1]
+            save(folder / "live_observation.json", dict(thread_id=row["thread_id"], turn_id=row["turn_id"],
+                 observed_at=now(), storage_status=turn.get("status"), item_count=len(turn.get("items", [])),
+                 note="Cold interrupted is inconclusive; use desktop activity/approval and file progress."))
+            if turn.get("status") == "completed":
+                completion_signal(actual, row["turn_id"], batch["id"])
+                row.update(status="AWAITING_PRIMARY_REVIEW", turn_status="completed", completed_at=now())
+                save(folder / "transcript.json", dict(thread_id=row["thread_id"], title=row["title"],
+                     project_id=project, cwd=str(root), turns=[dict(id=t["id"], status=t["status"],
+                     messages=[i for i in t.get("items", []) if i.get("type") == "agentMessage"]) for t in turns]))
+                checkpoint()
+                gate_path = folder / "primary_gate.json"
+                if not gate_path.exists():
+                    return "AWAITING_PRIMARY_REVIEW"
+                gate = read_json(gate_path)
+                identity = dict(batch=batch["id"], thread_id=row["thread_id"], turn_id=row["turn_id"],
+                                hashes=acceptance(root, batch))
+                require(gate.get("status") == "PASS" and all(gate.get(k) == v for k,v in identity.items()),
+                        "Primary gate does not match current turn/evidence")
+                return None
+            require(not (turn.get("status") == "failed" and turn.get("error")), "Actual batch failure; inspect original chat")
+        checkpoint()
+        if not getattr(checkpoint, "watch", False):
+            return row["status"]
+        time.sleep(getattr(checkpoint, "interval", 30))
 
 
-def run(root, path, plan, inputs, continue_after=None, client_factory=Client, adopt=None):
+def run(root, path, plan, inputs, continue_after=None, client_factory=Client, adopt=None, watch=False, interval=30):
     state_path = path.parent / "state.json"
     with exclusive(path.parent / "dispatch.lock"):
         state = read_json(state_path) if state_path.exists() else {"inputs": inputs, "batches": {}}
         require(state["inputs"] == inputs, "Plan or prompts changed; reconcile before resuming")
-        require(not adopt or state.get("status") == "BLOCKED", "Adoption requires an existing BLOCKED run")
+        require(15 <= interval <= 60, "Monitor interval must be 15..60 seconds")
         rows = state["batches"]
         ids = [r["thread_id"] for r in rows.values() if r.get("thread_id")]
         require(len(ids) == len(set(ids)), "Duplicate thread IDs in receipts")
@@ -403,6 +450,7 @@ def run(root, path, plan, inputs, continue_after=None, client_factory=Client, ad
             state["updated_at"] = now()
             save(state_path, state)
         checkpoint.task = plan["task"]
+        checkpoint.watch, checkpoint.interval = watch, interval
         try:
             for batch in plan["batches"]:
                 require(load_plan(root, path)[1] == inputs, "Plan/prompts changed during run")
@@ -413,7 +461,9 @@ def run(root, path, plan, inputs, continue_after=None, client_factory=Client, ad
                 else:
                     require(not local(root, batch["acceptance"]).exists() or row.get("thread_id"),
                             "Unregistered acceptance exists; reconcile provenance first")
-                    prepare_row(row)
+                    if row and not row.get("turn_id"):
+                        require(row.get("status") in {"QUEUED_FOR_DESKTOP", "WAITING_FOR_DESKTOP"} and row.get("queue_id"),
+                                "Uncertain create/queue receipt; inspect original chat")
                     if client is None:
                         client = client_factory(root)
                         project = project_id(client, root)
@@ -426,7 +476,13 @@ def run(root, path, plan, inputs, continue_after=None, client_factory=Client, ad
                         checkpoint()
                         adopt = None
                     state["status"] = "RUNNING"
-                    execute(client, root, project, batch, row, checkpoint)
+                    checkpoint.chat = chat_settings(plan, batch)
+                    pending = execute(client, root, project, batch, row, checkpoint)
+                    if pending:
+                        state["status"] = pending
+                        state.pop("error", None)
+                        checkpoint()
+                        return state
                     require(load_plan(root, path)[1] == inputs, "Plan/prompts changed during batch")
                     row.update(hashes=acceptance(root, batch), status="PASS", accepted_at=now())
                     checkpoint()
@@ -463,8 +519,11 @@ def main():
     mode.add_argument("--run", action="store_true")
     mode.add_argument("--status", action="store_true")
     parser.add_argument("--continue-after", help="Release an explicitly authorized pause")
+    parser.add_argument("--watch", action="store_true", help="Read-only polling; keep the coordinating turn attached")
+    parser.add_argument("--interval", type=int, default=30, choices=range(15, 61), metavar="15..60")
     parser.add_argument("--adopt-turn", help="Explicitly adopt Bxx=turnId in the same blocked chat; never sends input")
     args = parser.parse_args()
+    require(not args.watch or args.run, "--watch requires --run")
     require(not args.continue_after or args.run, "--continue-after requires --run")
     require(not args.adopt_turn or args.run, "--adopt-turn requires --run")
     adopt = None
@@ -478,7 +537,7 @@ def main():
     if args.status:
         print(json.dumps(read_json(path.parent / "state.json"), ensure_ascii=False, indent=2))
     elif args.run:
-        state = run(root, path, plan, inputs, args.continue_after, adopt=adopt)
+        state = run(root, path, plan, inputs, args.continue_after, adopt=adopt, watch=args.watch, interval=args.interval)
         print(state["status"], flush=True)
     else:
         for batch in plan["batches"]:

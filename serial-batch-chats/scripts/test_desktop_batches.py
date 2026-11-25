@@ -59,6 +59,20 @@ class DispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             dispatch.acceptance(self.root, batch)
 
+    @unittest.skipUnless(dispatch.os.name == "nt", "Windows transient file sharing")
+    def test_atomic_save_retries_only_transient_permission_error(self):
+        original = dispatch.os.replace
+        attempts = []
+        def replace(source, target):
+            attempts.append(source)
+            if len(attempts) == 1:
+                raise PermissionError("temporary sharing violation")
+            original(source, target)
+        with patch.object(dispatch.os, "replace", side_effect=replace):
+            dispatch.save(self.root / "saved.json", {"status": "verified"})
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(dispatch.read_json(self.root / "saved.json"), {"status": "verified"})
+
     def test_missing_or_same_reviewer_rejected(self):
         batch = self.plan["batches"][0]
         batch["review_roles"] = ["content", "repro"]
@@ -213,7 +227,7 @@ class DispatchTests(unittest.TestCase):
     def test_resume_completed_original_turn_without_sending_input(self):
         row = {"thread_id": "thread", "turn_id": "old", "title": "B01 question｜test"}
         client = self.terminal_client()
-        dispatch.execute(client, self.root, "project", self.plan["batches"][0], row, lambda: None)
+        self.assertEqual(dispatch.execute(client, self.root, "project", self.plan["batches"][0], row, lambda: None), "AWAITING_PRIMARY_REVIEW")
         self.assertNotIn("turn/start", client.methods)
         self.assertNotIn("thread/start", client.methods)
 
@@ -259,6 +273,89 @@ class DispatchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "newer or missing turn"):
                 dispatch.run(self.root, self.path, plan, inputs, continue_after="B01", client_factory=factory)
         self.assertEqual(calls, ["B01"])
+
+    def test_cold_interrupted_is_observation_without_resume_or_replay(self):
+        row = {"thread_id": "thread", "turn_id": "old", "title": "B01 question｜test", "status": "RUNNING"}
+        client = self.terminal_client()
+        client.thread["turns"][-1]["status"] = "interrupted"
+        result = dispatch.execute(client, self.root, "project", self.plan["batches"][0], row, lambda: None)
+        self.assertEqual(result, "RUNNING")
+        self.assertTrue(set(client.methods) <= {"thread/read", "thread/list"})
+
+    def test_completed_needs_exact_primary_gate(self):
+        batch = self.plan["batches"][0]
+        self.receipt(batch)
+        row = {"thread_id": "thread", "turn_id": "old", "title": "B01 question｜test"}
+        client = self.terminal_client()
+        self.assertEqual(dispatch.execute(client, self.root, "project", batch, row, lambda: None), "AWAITING_PRIMARY_REVIEW")
+        gate = dict(batch="B01", thread_id="thread", turn_id="wrong", status="PASS", hashes=dispatch.acceptance(self.root, batch))
+        dispatch.save(self.root / "B01/primary_gate.json", gate)
+        with self.assertRaisesRegex(ValueError, "Primary gate"):
+            dispatch.execute(client, self.root, "project", batch, row, lambda: None)
+        gate["turn_id"] = "old"
+        dispatch.save(self.root / "B01/primary_gate.json", gate)
+        self.assertIsNone(dispatch.execute(client, self.root, "project", batch, row, lambda: None))
+
+    def test_chat_defaults_and_batch_override(self):
+        self.plan["chat_defaults"] = {"model": "custom-model", "reasoning_effort": "high"}
+        self.plan["batches"][1]["chat"] = {"reasoning_effort": "ultra"}
+        self.loaded()
+        self.assertEqual(dispatch.chat_settings(self.plan, self.plan["batches"][1]),
+                         {"model": "custom-model", "reasoning_effort": "ultra"})
+        self.plan["batches"][0]["chat"] = {"reasoning_effort": ""}
+        with self.assertRaisesRegex(ValueError, "Invalid chat"):
+            self.loaded()
+
+    def test_queue_once_with_model_receipt_and_desktop_attach(self):
+        owner = self
+        class QueueClient:
+            def __init__(self):
+                self.methods = []
+                self.thread = None
+            def request(self, method, params):
+                self.methods.append(method)
+                if method == "thread/list":
+                    return {"data": [self.thread] if self.thread else [], "nextCursor": None}
+                if method == "thread/start":
+                    owner.assertEqual(params["model"], "chosen")
+                    owner.assertEqual(params["config"], {"model_reasoning_effort": "high"})
+                    self.thread = dict(id="created", name="B01 question｜test", cwd=str(owner.root),
+                                       projectId="project", source="vscode", ephemeral=False, turns=[])
+                    return dict(thread=self.thread, model="chosen", reasoningEffort="high")
+                if method == "thread/name/set": return {}
+                if method == "thread/read": return {"thread": self.thread}
+                if method == "thread/queue/add": return {"queuedSubmission": {"id": "queue"}}
+                if method == "thread/queue/list": return {"data": []}
+                raise AssertionError("Unexpected mutation: " + method)
+        def checkpoint(): pass
+        checkpoint.task = "test"
+        checkpoint.chat = {"model": "chosen", "reasoning_effort": "high"}
+        client, row = QueueClient(), {}
+        batch = self.plan["batches"][0]
+        self.assertEqual(dispatch.execute(client, self.root, "project", batch, row, checkpoint), "WAITING_FOR_DESKTOP")
+        dispatch.execute(client, self.root, "project", batch, row, checkpoint)
+        client.thread["turns"] = [{"id": "desktop", "status": "interrupted", "items": [{"type": "agentMessage", "text": "working"}]}]
+        self.assertEqual(dispatch.execute(client, self.root, "project", batch, row, checkpoint), "RUNNING")
+        self.assertEqual(row["turn_id"], "desktop")
+        self.assertEqual(client.methods.count("thread/start"), 1)
+        self.assertEqual(client.methods.count("thread/queue/add"), 1)
+        self.assertNotIn("turn/start", client.methods)
+        self.assertNotIn("thread/resume", client.methods)
+        mismatch, failed_row = QueueClient(), {}
+        original_request = mismatch.request
+        def wrong_effort(method, params):
+            response = original_request(method, params)
+            if method == "thread/start":
+                response["reasoningEffort"] = "low"
+            return response
+        mismatch.request = wrong_effort
+        with self.assertRaisesRegex(ValueError, "not confirmed"):
+            dispatch.execute(mismatch, self.root, "project", batch, failed_row, checkpoint)
+        self.assertEqual(failed_row["thread_id"], "created")
+        self.assertNotIn("thread/queue/add", mismatch.methods)
+        with self.assertRaisesRegex(ValueError, "Uncertain"):
+            dispatch.execute(mismatch, self.root, "project", batch, failed_row, checkpoint)
+        self.assertEqual(mismatch.methods.count("thread/start"), 1)
 
     @unittest.skipUnless(dispatch.os.name == "nt", "Windows UI Automation adapter")
     def test_sidebar_refresh_targets_project_and_full_title(self):
